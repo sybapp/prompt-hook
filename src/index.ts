@@ -130,6 +130,15 @@ async function extractAssistantTextFromStream(stream: ReadableStream<Uint8Array>
   let sawDone = false;
   const choiceTexts = new Map<number, string>();
 
+  const findDelimiter = (text: string): { index: number; length: number } | null => {
+    const lf = text.indexOf("\n\n");
+    const crlf = text.indexOf("\r\n\r\n");
+    if (lf === -1 && crlf === -1) return null;
+    if (lf === -1) return { index: crlf, length: 4 };
+    if (crlf === -1) return { index: lf, length: 2 };
+    return lf < crlf ? { index: lf, length: 2 } : { index: crlf, length: 4 };
+  };
+
   const flushEvent = (eventText: string) => {
     const lines = eventText.split(/\r?\n/);
     const dataLines = lines
@@ -166,10 +175,10 @@ async function extractAssistantTextFromStream(stream: ReadableStream<Uint8Array>
       buffer += decoder.decode(value, { stream: true });
 
       while (true) {
-        const sepIndex = buffer.indexOf("\n\n");
-        if (sepIndex === -1) break;
-        const event = buffer.slice(0, sepIndex);
-        buffer = buffer.slice(sepIndex + 2);
+        const delim = findDelimiter(buffer);
+        if (!delim) break;
+        const event = buffer.slice(0, delim.index);
+        buffer = buffer.slice(delim.index + delim.length);
         flushEvent(event);
         if (sawDone) {
           await reader.cancel();
