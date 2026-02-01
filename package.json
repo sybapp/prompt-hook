@@ -1,5 +1,5 @@
 {
-  "name": "hookprompt-worker",
+  "name": "prompt-hook-worker",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -14,4 +14,3 @@
     "wrangler": "^3.99.0"
   }
 }
-

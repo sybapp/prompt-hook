@@ -1,4 +1,4 @@
-# HookPrompt (Cloudflare Workers)
+# Prompt Hook (Cloudflare Workers)
 
 OpenAI-compatible gateway for `POST /v1/chat/completions` that:
 
@@ -17,9 +17,9 @@ npm i
 Create a D1 database and apply migrations:
 
 ```bash
-npx wrangler d1 create hookprompt-db
+npx wrangler d1 create prompt-hook-db
 # Copy the returned database_id into wrangler.toml (d1_databases.database_id)
-npx wrangler d1 migrations apply hookprompt-db --local
+npx wrangler d1 migrations apply prompt-hook-db --local
 ```
 
 Run locally:
@@ -47,4 +47,3 @@ The Worker **requires** the client to send `Authorization: Bearer ...` and will 
 
 - Upstream base URL is configurable via `UPSTREAM_BASE_URL` (default `https://api.openai.com`).
 - D1 only stores extracted text parts; non-text message parts are ignored.
-
