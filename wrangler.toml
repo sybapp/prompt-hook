@@ -7,3 +7,9 @@ compatibility_date = "2026-02-01"
 
 [vars]
 UPSTREAM_BASE_URL = "https://api.openai.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "prompt-hook-db"
+database_id = "0fb3e5e0-80fe-4568-90ef-600f38c22d00"
+migrations_dir = "migrations"
