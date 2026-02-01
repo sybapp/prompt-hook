@@ -17,8 +17,9 @@ npm i
 Create a D1 database and apply migrations:
 
 ```bash
+# Option A (Dashboard): Create a D1 database and run the SQL in `migrations/0001_prompt_logs.sql`
+# Option B (Wrangler CLI): Create the D1 database, bind it as `DB`, then apply migrations.
 npx wrangler d1 create prompt-hook-db
-# Copy the returned database_id into wrangler.toml (d1_databases.database_id)
 npx wrangler d1 migrations apply prompt-hook-db --local
 ```
 
