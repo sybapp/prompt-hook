@@ -15,6 +15,16 @@ type Env = {
   UPSTREAM_BASE_URL?: string;
 };
 
+type ChatCompletionChoice = {
+  index?: number;
+  message?: { content?: unknown } | null;
+  delta?: { content?: unknown } | null;
+};
+
+type ChatCompletionResponseBody = {
+  choices?: ChatCompletionChoice[];
+};
+
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   if (!headers.has("content-type")) headers.set("content-type", "application/json; charset=utf-8");
@@ -89,9 +99,95 @@ function mergeHeaders(base: Headers, extra: Headers): Headers {
   return merged;
 }
 
-async function logPrompts(env: Env, body: ChatCompletionsRequestBody, req: Request): Promise<void> {
+function mergeChoiceTexts(choiceTexts: Map<number, string>): string {
+  const indices = [...choiceTexts.keys()].sort((a, b) => a - b);
+  const parts: string[] = [];
+  for (const index of indices) {
+    const value = choiceTexts.get(index);
+    if (!value) continue;
+    if (indices.length === 1) parts.push(value);
+    else parts.push(`--- choice ${index} ---\n${value}`);
+  }
+  return parts.join("\n\n").trim();
+}
+
+function extractAssistantTextFromResponse(body: ChatCompletionResponseBody): string {
+  const choiceTexts = new Map<number, string>();
+  for (const choice of body.choices ?? []) {
+    const index = typeof choice.index === "number" ? choice.index : 0;
+    const content = choice.message?.content ?? null;
+    const text = extractText(content);
+    if (!text) continue;
+    choiceTexts.set(index, (choiceTexts.get(index) ?? "") + text);
+  }
+  return mergeChoiceTexts(choiceTexts);
+}
+
+async function extractAssistantTextFromStream(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sawDone = false;
+  const choiceTexts = new Map<number, string>();
+
+  const flushEvent = (eventText: string) => {
+    const lines = eventText.split(/\r?\n/);
+    const dataLines = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .filter((line) => line.length > 0);
+    if (dataLines.length === 0) return;
+
+    const data = dataLines.join("\n");
+    if (data === "[DONE]") {
+      sawDone = true;
+      return;
+    }
+
+    let parsed: ChatCompletionResponseBody | null = null;
+    try {
+      parsed = JSON.parse(data) as ChatCompletionResponseBody;
+    } catch {
+      return;
+    }
+
+    for (const choice of parsed.choices ?? []) {
+      const index = typeof choice.index === "number" ? choice.index : 0;
+      const text = extractText(choice.delta?.content ?? null);
+      if (!text) continue;
+      choiceTexts.set(index, (choiceTexts.get(index) ?? "") + text);
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      while (true) {
+        const sepIndex = buffer.indexOf("\n\n");
+        if (sepIndex === -1) break;
+        const event = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+        flushEvent(event);
+        if (sawDone) {
+          await reader.cancel();
+          break;
+        }
+      }
+
+      if (sawDone) break;
+    }
+  } finally {
+    decoder.decode();
+  }
+
+  return mergeChoiceTexts(choiceTexts);
+}
+
+async function insertPromptLog(env: Env, id: string, body: ChatCompletionsRequestBody, req: Request): Promise<void> {
   const { systemPrompt, userPrompt } = extractPrompts(body.messages);
-  const id = crypto.randomUUID();
   const createdAt = new Date().toISOString();
   const model = typeof body.model === "string" ? body.model : null;
   const clientIp = req.headers.get("cf-connecting-ip") ?? req.headers.get("x-forwarded-for");
@@ -102,6 +198,10 @@ async function logPrompts(env: Env, body: ChatCompletionsRequestBody, req: Reque
   )
     .bind(id, createdAt, model, systemPrompt, userPrompt, clientIp, userAgent)
     .run();
+}
+
+async function updateAssistantOutput(env: Env, id: string, assistantOutput: string): Promise<void> {
+  await env.DB.prepare("UPDATE prompt_logs SET assistant_output = ?2 WHERE id = ?1").bind(id, assistantOutput).run();
 }
 
 export default {
@@ -129,11 +229,12 @@ export default {
       return jsonResponse({ error: { message: "Invalid JSON body" } }, { status: 400, headers: corsHeaders() });
     }
 
-    ctx.waitUntil(
-      logPrompts(env, body, req).catch((err) => {
-        console.error("Failed to log prompts to D1", err);
-      })
-    );
+    const logId = crypto.randomUUID();
+    try {
+      await insertPromptLog(env, logId, body, req);
+    } catch (err) {
+      console.error("Failed to insert prompt log to D1", err);
+    }
 
     const upstreamBase = (env.UPSTREAM_BASE_URL ?? "https://api.openai.com").replace(/\/+$/, "");
     const upstreamUrl = `${upstreamBase}/v1/chat/completions`;
@@ -143,6 +244,34 @@ export default {
       headers: upstreamHeaders,
       body: JSON.stringify(body)
     });
+
+    const shouldTryCaptureOutput = upstreamResp.ok;
+    if (shouldTryCaptureOutput) {
+      if (body.stream === true && upstreamResp.body) {
+        const [clientStream, logStream] = upstreamResp.body.tee();
+        ctx.waitUntil(
+          extractAssistantTextFromStream(logStream)
+            .then((assistantOutput) => updateAssistantOutput(env, logId, assistantOutput))
+            .catch((err) => console.error("Failed to capture assistant output (stream)", err))
+        );
+
+        const outHeaders = new Headers(upstreamResp.headers);
+        return new Response(clientStream, {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: mergeHeaders(outHeaders, corsHeaders())
+        });
+      }
+
+      ctx.waitUntil(
+        upstreamResp
+          .clone()
+          .json<ChatCompletionResponseBody>()
+          .then((json) => extractAssistantTextFromResponse(json))
+          .then((assistantOutput) => updateAssistantOutput(env, logId, assistantOutput))
+          .catch((err) => console.error("Failed to capture assistant output (non-stream)", err))
+      );
+    }
 
     const outHeaders = new Headers(upstreamResp.headers);
     const out = new Response(upstreamResp.body, {
